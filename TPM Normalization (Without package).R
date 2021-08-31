@@ -1,4 +1,5 @@
 #Make the count matrix a data frame
+#Here cnt is the raw count matrix
 countdata <- data.frame( GeneID=rownames(cnt), cnt)
 countdata <- geneLength %>%
   inner_join(countdata) %>%
