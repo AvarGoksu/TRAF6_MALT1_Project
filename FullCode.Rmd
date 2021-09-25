@@ -1,0 +1,2030 @@
+```{r}
+rm(list=ls())
+```
+
+```{r}
+library("Rsubread")
+library("tidyverse")
+library("readxl")
+library("vsn")
+library("tsne")
+library("reshape2")
+library("xlsx")
+library("DEGreport")
+library("ggpubr")
+library("knitr")
+library("gridExtra")
+library("DESeq2")
+library("ggplot2")
+library("dplyr")
+library("ggrepel")
+```
+
+```{r}
+subread.counts <- readRDS("subreadcounts.rds")
+```
+
+```{r}
+rawtable <- read.csv("rawtable.csv")
+rcounts <- rawtable[,-1]
+rownames(rcounts) <- rawtable[,1] 
+```
+
+```{r}
+cnt <- rcounts[(rowSums(rcounts)>0),] 
+colnames(cnt) <- sub(".out.bam", "", colnames(cnt))
+dim(cnt)
+head(cnt)
+```
+
+```{r}
+mouse_markers <- read.csv("MRK_List2.tsv", row.names = NULL, sep="\t")
+mouse_markers
+```
+
+```{r}
+coding_genes <- mouse_markers %>%
+  dplyr::filter(Feature.Type == "protein coding gene") %>%
+  dplyr::select(MGI.Accession.ID, Marker.Symbol, Marker.Name, Feature.Type, Marker.Synonyms..pipe.separated.) %>%
+  column_to_rownames(var="Marker.Symbol")
+
+coding_genes
+```
+```{r}
+cnt <- subset(cnt, rownames(cnt) %in% rownames(coding_genes))
+```
+
+```{r}
+Gm_genes <- cnt[grep("^Gm\\d", rownames(cnt)),]
+Gm_genes <- as.data.frame(Gm_genes)
+```
+
+```{r}
+Rik_genes <- cnt[grep("Rik", rownames(cnt)),]
+Rik_genes <- as.data.frame(Rik_genes)
+```
+
+```{r}
+Igh_genes <- cnt[grep("^Igh", rownames(cnt)),]
+Igh_genes <- as.data.frame(Igh_genes)
+```
+
+```{r}
+Igk_genes <- cnt[grep("^Igk", rownames(cnt)),]
+Igk_genes <- as.data.frame(Igk_genes)
+```
+
+```{r}
+Igl_genes <- cnt[grep("^Igl", rownames(cnt)),]
+Igl_genes <- as.data.frame(Igl_genes)
+```
+
+
+```{r}
+Genes_to_filterout <- bind_rows(Igh_genes, Igk_genes, Igl_genes)
+```
+
+```{r}
+cnt <- subset(cnt, !(rownames(cnt) %in% rownames(Genes_to_filterout)))
+```
+
+
+```{r}
+geneLength <- subread.counts$annotation %>%
+  dplyr::select("GeneID", "Length")
+```
+
+```{r}
+#make countdata a dataframe
+countdata <- data.frame( GeneID=rownames(cnt), cnt)
+countdata <- geneLength %>%
+  inner_join(countdata) %>%
+  mutate(Length=ifelse(Length-151+1>0,Length-151+1,1))
+
+tpm<-countdata %>%
+  pivot_longer( cols = starts_with("Sample"), names_to = "sample", 
+                values_to = "cnt") %>% 
+  group_by(sample) %>%
+  mutate(rpk = cnt/ (Length/1000) , libSize = sum(rpk), tpm = rpk / libSize *1e6 )
+```
+
+```{r}
+tpm <- tpm %>% mutate( minTPM= min(tpm[tpm>0]), log10TPM = log10(tpm+minTPM))
+head(tpm)
+```
+
+```{r}
+# let's remove columns with intermediate results
+tpm<- tpm %>% dplyr::select(-libSize,-rpk,-minTPM)
+
+png(file="TPM_filtered.png")
+ggplot(tpm,aes(x=sample,y=log10TPM))+ 
+  geom_boxplot()+
+  coord_flip()+ 
+  ylab(expression(log[10](TPM)))+
+  ggtitle("TPM (Filtered)")
+dev.off()
+
+library(openxlsx)
+openxlsx::write.xlsx(tpm, "TPM_Before_Filtering.xlsx", overwrite = TRUE)
+```
+
+```{r}
+tpm %>% summarise( no.of.genes=sum( tpm>=1 ))
+```
+
+```{r}
+#the tibble tpm is grouped according to samples, this grouping needs to be removed
+tpm2<-tpm %>% ungroup() %>% group_by(GeneID) %>%
+dplyr::filter( sum(tpm<1) < 7 )
+cnt.tib <- tpm2 %>% dplyr::select(GeneID,sample,cnt) %>% pivot_wider(names_from = sample,
+values_from = cnt )
+#DEseq wants a count matrix not a tibble
+cnt.filt<-as.matrix(cnt.tib[,-1]) 
+rownames(cnt.filt)<-cnt.tib$GeneID
+```
+
+```{r}
+coldata <- read_excel("/Users/GoksuAvar/Desktop/HelmholtzProject/coldata.xlsx")
+coldata <- as.matrix(coldata, rownames.force = NA)
+rownames(coldata) <- coldata[,1]
+coldata <- coldata[,-1]
+```
+
+```{r}
+coldata <- as.data.frame(coldata) %>% 
+  mutate(RIN2 = case_when(as.integer(RIN) > 8.5 ~ "perfect", as.integer(RIN) < 8.5 ~ "okay"))
+```
+
+```{r}
+all(rownames(coldata) %in% colnames(cnt))
+```
+
+```{r}
+all(rownames(coldata) == colnames(cnt))
+```
+
+```{r}
+order <- c("Sample_MUC26944","Sample_MUC26945","Sample_MUC26951","Sample_MUC26952","Sample_MUC26953", "Sample_MUC26950", "Sample_MUC26954", "Sample_MUC26956", "Sample_MUC26957", "Sample_MUC26958", "Sample_MUC26946", "Sample_MUC26947", "Sample_MUC26948", "Sample_MUC26949", "Sample_MUC26955")
+
+cnt.filt <- cnt.filt[,order]
+cnt <- cnt[,order]
+coldata <- coldata[order,]
+all(rownames(coldata) == colnames(cnt.filt))
+all(rownames(coldata) == colnames(cnt))
+
+```
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = cnt,
+                              colData = coldata,
+                              design = ~ Genotype)
+dds
+```
+
+```{r}
+keep <- rowSums(counts(dds)) >= 10
+dds<- dds[keep,]
+```
+
+```{r}
+dds<- DESeq(dds)
+res_tbmt_traf6dt <- DESeq2::results(dds, contrast=c("Genotype","TBMT","Traf6dT"), alpha = 0.1)
+res_tbmt_ctrl <- DESeq2::results(dds, contrast=c("Genotype","TBMT","Control"), alpha = 0.1)
+res_traf6dt_ctrl <- DESeq2::results(dds, contrast=c("Genotype","Traf6dT","Control"), alpha = 0.1)
+```
+
+```{r}
+summary(res_tbmt_traf6dt)
+summary(res_tbmt_ctrl)
+summary(res_traf6dt_ctrl)
+```
+```{r}
+resultsNames(dds)
+```
+```{r}
+png("Phist_TBMT_Traf6dT.png")
+hist(res_tbmt_traf6dt$pvalue, main="TBMT vs Traf6dT (Filtered)", xlab="p-values",cex.main=1.5)
+dev.off()
+
+png("Padj_TBMT_Traf6dT.png")
+hist(res_tbmt_traf6dt$padj, main="TBMT vs Traf6dT (Filtered)", xlab="padj-values",cex.main=1.5)
+dev.off()
+
+png("Phist_TBMT_Control.png")
+hist(res_tbmt_ctrl$pvalue, main="TBMT vs Control (Filtered)", xlab="p-values",cex.main=1.5)
+dev.off()
+
+png("Padj_TBMT_Control.png")
+hist(res_tbmt_ctrl$padj, main="TBMT vs Control (Filtered)", xlab="padj-values",cex.main=1.5)
+dev.off()
+
+png("Phist_Traf6dT_Control.png")
+hist(res_traf6dt_ctrl$pvalue, main="Traf6dT vs Control (Filtered)", xlab="p-values",cex.main=1.5)
+dev.off()
+
+png("Padj_Traf6dT_Control.png")
+hist(res_traf6dt_ctrl$padj, main="Traf6dT vs Control (Filtered)", xlab="padj-values",cex.main=1.5)
+dev.off()
+```
+
+
+```{r}
+
+vsd <- vst(dds, blind=FALSE)
+vsdMat <- assay(vsd)
+```
+
+```{r}
+library("pheatmap")
+select <- order(rowMeans(counts(dds,normalized=TRUE)),
+                decreasing=TRUE)[1:50]
+df <- as.data.frame(coldata$Genotype)
+rownames(df) <- row.names(coldata)
+
+png("Heatmap.png", width=1980, height = 1440)
+pheatmap(vsdMat[select,], cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df)
+dev.off()
+```
+
+```{r}
+meanSdPlot(assay(vsd))
+```
+```{r}
+vsdmelted <- melt(vsdMat)
+
+png("VSD.png")
+ggplot(vsdmelted, aes(x=Var2, y=value))+
+  geom_boxplot()+
+  coord_flip()+
+  ylab("Variance stabilized counts")+
+  xlab("Sample")+
+  ggtitle("VST")
+dev.off()
+```
+```{r}
+rlog <- rlog(dds)
+rlogMat <- assay(rlog)
+rlogmelted <- melt(rlogMat)
+
+png("rlog.png")
+ggplot(rlogmelted, aes(x=Var2, y=value))+
+  geom_boxplot()+
+  coord_flip()+
+  ylab("rlog transformed counts")+
+  xlab("Sample")+
+  ggtitle("rlog")
+dev.off()
+```
+
+```{r}
+pcaData <- plotPCA(vsd, intgroup=c("Genotype", "Sex"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=Genotype, shape = Sex)) +
+  geom_point(size=3) +
+  geom_text(aes(label=pcaData$name), vjust = 2, hjust = 0.9,  size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()
+```
+```{r}
+library(pcaExplorer)
+
+pcaExplorer::pcaplot3d(rlog,intgroup=c("Genotype"), text_labels = TRUE)
+```
+
+
+```{r}
+png(file="PCA.png", height=600, width=800)
+pcaData <- plotPCA(rlog, intgroup=c("Genotype", "Sex"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=Genotype, shape=Sex)) +
+  geom_point(size=7) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  theme(axis.title = element_text(size = 27, face = "bold"))+
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  theme(axis.title = element_text(size = 27, face = "bold"))+
+  ggtitle("PCA") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line(), plot.title = element_text(size=30, face="bold")) +
+  geom_text_repel(aes(label=name), size=4, color="black", nudge_y = 1, fontface="bold",  min.segment.length = unit(0.1, "lines"))+
+  coord_fixed()
+dev.off()
+```
+
+
+```{r}
+res_tbmt_ctrl_sig_sort_LFC <-data.frame(gene = rownames(res_tbmt_ctrl), res_tbmt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>%
+filter(padj<0.1) %>%
+arrange(desc(abs(log2FoldChange)))
+```
+
+```{r}
+res_tbmt_ctrl_sig_sort_p <-data.frame(gene = rownames(res_tbmt_ctrl), res_tbmt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>%
+filter(padj<0.1) %>%
+arrange(padj)
+```
+
+```{r}
+res_traf6dt_ctrl_sig_sort_LFC <-data.frame(gene = rownames(res_traf6dt_ctrl), res_traf6dt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>%
+filter(padj<0.1) %>%
+arrange(desc( abs(log2FoldChange) ))
+```
+
+```{r}
+res_traf6dt_ctrl_sig_sort_p <-data.frame(gene = rownames(res_traf6dt_ctrl), res_traf6dt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>%
+filter(padj<0.1) %>%
+arrange(padj)
+```
+
+```{r}
+res_tbmt_traf6dt_sig_sort_LFC <-data.frame(gene = rownames(res_tbmt_traf6dt), res_tbmt_traf6dt,
+stringsAsFactors = F) %>% na.omit() %>%
+filter(padj<0.1) %>%
+arrange(desc( abs(log2FoldChange) ))
+```
+
+```{r}
+res_tbmt_traf6dt_sig_sort_p <-data.frame(gene = rownames(res_tbmt_traf6dt), res_tbmt_traf6dt,
+stringsAsFactors = F) %>% na.omit() %>%
+filter(padj<0.1) %>%
+arrange(padj)
+```
+
+```{r}
+sig_genelist_tbmt_traf6dt <- res_tbmt_traf6dt_sig_sort_p$gene[1:50]
+sig_genelist_tbmt_ctrl <- res_tbmt_ctrl_sig_sort_p$gene[1:50]
+sig_genelist_traf6dt_ctrl <- res_traf6dt_ctrl_sig_sort_p$gene[1:50]
+
+sig_list_combined <- unique(c(sig_genelist_tbmt_traf6dt, sig_genelist_tbmt_ctrl, sig_genelist_traf6dt_ctrl))
+
+```
+
+```{r}
+library("pheatmap")
+
+df <- as.data.frame(coldata$Genotype)
+rownames(df) <- row.names(coldata)
+colnames(df) <- c("Genotype")
+png("Heatmap.png", width=1280, height = 1440)
+pheatmap(vsdMat[sig_list_combined,], cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df, scale = "row", fontsize = 30, fontsize_col = 20, fontsize_row = 12)
+dev.off()
+```
+
+```{r}
+genelist <- c("Nfkbid", "Nfkbiz", "Icos","Tnfrsf4", "Il6", "Irf4", "Zc3h12a", "Rel", "Il6ra", "Il6st",  "Ier3", "Id1", "Cxcl2", "Tm2d3", "Metap1","Smad9","Shcbp1l", "Hhat","Ptgs2", "Atf3", "Tubd1", "Mafk", "Traf1", "Edn1", "Il8","Ptch2", "Col22a1","Cxcl1")
+
+genelist2 <- c("Sharpin", "Tab1", "Tab2", "Tab3", "Map2k7", "Mapk8", "Ikbkb", "Chuk", "Ikbkg", "Nfkbia", "Rbck1", "Rnf31", "Bcl10", "Malt1", "Nlrp3", "Prkcq")
+```
+
+```{r}
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(ReactomePA)
+
+res_tbmt_ctrl_greater<-results(dds,
+contrast= c("Genotype","TBMT","Control"),
+altHypothesis = "greater") #we do one sided hypothesis testing
+res_tbmt_ctrl_greater<-data.frame(rn= rownames(res_tbmt_ctrl_greater),res_tbmt_ctrl_greater) %>% na.omit()
+#make a named vector of P adjusted
+tbmt_up <- res_tbmt_ctrl_greater$padj 
+names(tbmt_up) <- res_tbmt_ctrl_greater$rn
+
+ensgEntrez_tbmt <- AnnotationDbi::select(org.Mm.eg.db, keys=names(tbmt_up), columns='ENTREZID', keytype='SYMBOL')
+
+df_tbmt <-ensgEntrez_tbmt %>%
+  dplyr::inner_join(res_tbmt_ctrl_greater, by=c("SYMBOL"="rn")) %>% 
+  dplyr::select(ENTREZID,log2FoldChange,padj) %>% 
+  dplyr::group_by(ENTREZID) %>%
+  dplyr::summarise(lfc=mean(log2FoldChange), up=min(padj))
+
+sg<-unique(( df_tbmt %>% dplyr::filter(up<=0.1))$ENTREZID)
+x_tbmt_up <- enrichPathway(gene=sg,organism = "mouse",
+universe= unique(df_tbmt$ENTREZID),
+pvalueCutoff=0.1, pAdjustMethod="BH", readable=T)
+
+png(file="ReactomeDot_TBMT_Control_Up.png", width=1440, height=1280)
+dotplot(x_tbmt_up, showCategory=30, font.size=15, label_format = 10) + ggtitle("TBMT vs Control Upregulated") + theme(plot.title = element_text(size = 30, face = "bold"))
+dev.off()
+
+tbmt_lfc<-df_tbmt$lfc 
+names(tbmt_lfc)<-df_tbmt$ENTREZID
+
+lfc <-df_tbmt$lfc
+names(lfc)<-df_tbmt$ENTREZID
+png(file="CNET_TBMT_Control_Up.png", width=1440, height=1440)
+cnetplot(x_tbmt_up, showCategory =10, foldChange=2^lfc,cex_label_gene = 1.2, cex_label_category = 1.8) + ggtitle("TBMT vs Control Upregulated") + theme(plot.title = element_text(size = 40, face = "bold"))
+dev.off()
+```
+
+```{r}
+res_tbmt_ctrl_less<-results(dds,
+contrast= c("Genotype","TBMT","Control"),
+altHypothesis = "less") #we do one sided hypothesis testing
+res_tbmt_ctrl_less<-data.frame(rn= rownames(res_tbmt_ctrl_less),res_tbmt_ctrl_less) %>% na.omit()
+#make a named vector of P adjusted
+tbmt_down <- res_tbmt_ctrl_greater$padj 
+names(tbmt_down) <- res_tbmt_ctrl_greater$rn
+
+ensgEntrez_tbmt <- AnnotationDbi::select(org.Mm.eg.db, keys=names(tbmt_up), columns='ENTREZID', keytype='SYMBOL')
+
+df_tbmt <-ensgEntrez_tbmt %>%
+  dplyr::inner_join(res_tbmt_ctrl_less, by=c("SYMBOL"="rn")) %>% 
+  dplyr::select(ENTREZID,log2FoldChange,padj) %>% 
+  dplyr::group_by(ENTREZID) %>%
+  dplyr::summarise(lfc=mean(log2FoldChange), up=min(padj))
+
+sg<-unique(( df_tbmt %>% dplyr::filter(up<=0.1))$ENTREZID)
+x_tbmt_down <- enrichPathway(gene=sg,organism = "mouse",
+universe= unique(df_tbmt$ENTREZID),
+pvalueCutoff=0.1, pAdjustMethod="BH", readable=T)
+
+png(file="ReactomeDot_TBMT_Control_Down.png", width=1440, height=720)
+dotplot(x_tbmt_down, showCategory=15, font.size=15, label_format = 10) + ggtitle("TBMT vs Control Downregulated") + theme(plot.title = element_text(size = 30, face = "bold"))
+dev.off()
+
+
+lfc <-df_tbmt$lfc
+names(lfc)<-df_tbmt$ENTREZID
+
+png(file="CNET_TBMT_Control_Down.png", width=1440, height=1440)
+cnetplot(x_tbmt_down, showCategory =15, foldChange=2^lfc,cex_label_gene = 2, cex_label_category = 2) + ggtitle("TBMT vs Control Downregulated") + theme(plot.title = element_text(size = 40, face = "bold"))
+dev.off()
+```
+
+```{r}
+res_traf6dt_ctrl_greater<-results(dds,
+contrast= c("Genotype","Traf6dT","Control"),
+altHypothesis = "greater") #we do one sided hypothesis testing
+res_traf6dt_ctrl_greater<-data.frame(rn= rownames(res_traf6dt_ctrl_greater),res_traf6dt_ctrl_greater) %>% na.omit()
+#make a named vector of P adjusted
+traf6dt_up <- res_traf6dt_ctrl_greater$padj 
+names(traf6dt_up) <- res_traf6dt_ctrl_greater$rn
+
+ensgEntrez_traf6dt <- AnnotationDbi::select(org.Mm.eg.db, keys=names(traf6dt_up), columns='ENTREZID', keytype='SYMBOL')
+
+df_traf6dt <-ensgEntrez_traf6dt %>%
+  dplyr::inner_join(res_traf6dt_ctrl_greater, by=c("SYMBOL"="rn")) %>% 
+  dplyr::select(ENTREZID,log2FoldChange,padj) %>% 
+  dplyr::group_by(ENTREZID) %>%
+  dplyr::summarise(lfc=mean(log2FoldChange), up=min(padj))
+
+sg<-unique(( df_traf6dt %>% dplyr::filter(up<=0.1))$ENTREZID)
+x_traf6dt_up <- enrichPathway(gene=sg,organism = "mouse",
+universe= unique(df_traf6dt$ENTREZID),
+pvalueCutoff=0.1, pAdjustMethod="BH", readable=T)
+
+png(file="ReactomeDot_Traf6dT_Control_Up.png", width=1440, height=1290)
+dotplot(x_traf6dt_up, showCategory=30, font.size=15, label_format = 10) + ggtitle("Traf6dT vs Control Upregulated") + theme(plot.title = element_text(size = 30, face = "bold"))
+dev.off()
+
+traf6dt_lfc<-df_traf6dt$lfc 
+names(traf6dt_lfc)<-df_traf6dt$ENTREZID
+
+lfc <-df_traf6dt$lfc
+names(lfc)<-df_traf6dt$ENTREZID
+png(file="CNET_Traf6dT_Control_Up.png", width=1980, height=1440)
+cnetplot(x_traf6dt_up, showCategory =15, foldChange=2^lfc,cex_label_gene = 1.2, cex_label_category = 1.8) + ggtitle("Traf6dT vs Control Upregulated") + theme(plot.title = element_text(size = 40, face = "bold"))
+dev.off()
+```
+
+```{r}
+res_traf6dt_ctrl_less<-results(dds,
+contrast= c("Genotype","Traf6dT","Control"),
+altHypothesis = "less") #we do one sided hypothesis testing
+res_traf6dt_ctrl_less<-data.frame(rn= rownames(res_traf6dt_ctrl_less),res_traf6dt_ctrl_less) %>% na.omit()
+#make a named vector of P adjusted
+traf6dt_down <- res_traf6dt_ctrl_less$padj 
+names(traf6dt_down) <- res_traf6dt_ctrl_less$rn
+
+ensgEntrez_traf6dt <- AnnotationDbi::select(org.Mm.eg.db, keys=names(traf6dt_down), columns='ENTREZID', keytype='SYMBOL')
+
+df_traf6dt <-ensgEntrez_traf6dt %>%
+  dplyr::inner_join(res_traf6dt_ctrl_less, by=c("SYMBOL"="rn")) %>% 
+  dplyr::select(ENTREZID,log2FoldChange,padj) %>% 
+  dplyr::group_by(ENTREZID) %>%
+  dplyr::summarise(lfc=mean(log2FoldChange), up=min(padj))
+
+sg<-unique(( df_traf6dt %>% dplyr::filter(up<=0.1))$ENTREZID)
+x_traf6dt_down <- enrichPathway(gene=sg,organism = "mouse",
+universe= unique(df_traf6dt$ENTREZID),
+pvalueCutoff=0.1, pAdjustMethod="BH", readable=T)
+
+png(file="ReactomeDot_Traf6dT_Control_Down.png", width=1440, height=720)
+dotplot(x_traf6dt_down, showCategory=15, font.size=15, label_format = 10) + ggtitle("Traf6dT vs Control Downregulated") + theme(plot.title = element_text(size = 30, face = "bold"))
+dev.off()
+
+traf6dt_lfc<-df_traf6dt$lfc 
+names(traf6dt_lfc)<-df_traf6dt$ENTREZID
+
+lfc <-df_traf6dt$lfc
+names(lfc)<-df_traf6dt$ENTREZID
+png(file="CNET_Traf6dT_Control_Down.png", width=1440, height=1440)
+cnetplot(x_traf6dt_down, showCategory =15, foldChange=2^lfc,cex_label_gene = 2, cex_label_category = 2) + ggtitle("Traf6dT vs Control Downregulated") + theme(plot.title = element_text(size = 40, face = "bold"))
+dev.off()
+```
+
+
+```{r}
+res_tbmt_traf6dt_greater<-results(dds,
+contrast= c("Genotype","TBMT","Traf6dT"),
+altHypothesis = "greater") #we do one sided hypothesis testing
+res_tbmt_traf6dt_greater<-data.frame(rn= rownames(res_tbmt_traf6dt_greater),res_tbmt_traf6dt_greater) %>% na.omit()
+#make a named vector of P adjusted
+tbmt_traf6dt_up <- res_tbmt_traf6dt_greater$padj 
+names(tbmt_traf6dt_up) <- res_tbmt_traf6dt_greater$rn
+
+ensgEntrez_tbmt_traf6dt <- AnnotationDbi::select(org.Mm.eg.db, keys=names(tbmt_traf6dt_up), columns='ENTREZID', keytype='SYMBOL')
+
+df_tbmt_traf6dt <-ensgEntrez_tbmt_traf6dt %>%
+  dplyr::inner_join(res_tbmt_traf6dt_greater, by=c("SYMBOL"="rn")) %>% 
+  dplyr::select(ENTREZID,log2FoldChange,padj) %>% 
+  dplyr::group_by(ENTREZID) %>%
+  dplyr::summarise(lfc=mean(log2FoldChange), up=min(padj))
+
+sg<-unique(( df_tbmt_traf6dt %>% dplyr::filter(up<=0.1))$ENTREZID)
+x_tbmt_traf6dt_up <- enrichPathway(gene=sg,organism = "mouse",
+universe= unique(df_tbmt_traf6dt$ENTREZID),
+pvalueCutoff=0.1, pAdjustMethod="BH", readable=T)
+
+png(file="ReactomeDot_TBMT_Traf6dT_Up.png", width=1440, height=1280)
+dotplot(x_tbmt_traf6dt_up , showCategory=30, font.size=15, label_format = 10) + ggtitle("TBMT vs Traf6dT Direct Comparison (Upregulated in TBMT)") + theme(plot.title = element_text(size = 30, face = "bold"))
+dev.off()
+
+tbmt_traf6dt_lfc<-df_tbmt_traf6dt$lfc 
+names(tbmt_traf6dt_lfc)<-df_tbmt_traf6dt$ENTREZID
+
+
+lfc <-df_tbmt_traf6dt$lfc
+names(lfc)<-df_tbmt_traf6dt$ENTREZID
+png(file="CNET_TBMT_Traf6dT_Up.png", width=1440, height=1440)
+cnetplot(x_tbmt_traf6dt_up , showCategory =15, foldChange=2^lfc,cex_label_gene = 2, cex_label_category = 2) + ggtitle("TBMT vs Traf6dT Direct Comparison (Upregulated in TBMT)") + theme(plot.title = element_text(size = 40, face = "bold"))
+dev.off()
+```
+
+```{r}
+res_tbmt_traf6dt_less<-results(dds,
+contrast= c("Genotype","TBMT","Traf6dT"),
+altHypothesis = "less") #we do one sided hypothesis testing
+res_tbmt_traf6dt_less<-data.frame(rn= rownames(res_tbmt_traf6dt_less),res_tbmt_traf6dt_less) %>% na.omit()
+#make a named vector of P adjusted
+tbmt_traf6dt_down <- res_tbmt_traf6dt_less$padj 
+names(tbmt_traf6dt_down) <- res_tbmt_traf6dt_less$rn
+
+ensgEntrez_tbmt_traf6dt <- AnnotationDbi::select(org.Mm.eg.db, keys=names(tbmt_traf6dt_down), columns='ENTREZID', keytype='SYMBOL')
+
+df_tbmt_traf6dt <-ensgEntrez_tbmt_traf6dt %>%
+  dplyr::inner_join(res_tbmt_traf6dt_less, by=c("SYMBOL"="rn")) %>% 
+  dplyr::select(ENTREZID,log2FoldChange,padj) %>% 
+  dplyr::group_by(ENTREZID) %>%
+  dplyr::summarise(lfc=mean(log2FoldChange), up=min(padj))
+
+sg<-unique(( df_tbmt_traf6dt %>% dplyr::filter(up<=0.1))$ENTREZID)
+x_tbmt_traf6dt_down <- enrichPathway(gene=sg,organism = "mouse",
+universe= unique(df_tbmt_traf6dt$ENTREZID),
+pvalueCutoff=0.1, pAdjustMethod="BH", readable=T)
+
+png(file="ReactomeDot_TBMT_Traf6dT_Down.png", width=1440, height=1280)
+dotplot(x_tbmt_traf6dt_down, showCategory=30, font.size=15, label_format = 10) + ggtitle("TBMT vs Traf6dT Direct Comparison (Upregulated in Traf6dT)") + theme(plot.title = element_text(size = 30, face = "bold"))
+dev.off()
+
+tbmt_traf6dt_lfc<-df_tbmt_traf6dt$lfc 
+names(tbmt_traf6dt_lfc)<-df_tbmt_traf6dt$ENTREZID
+
+lfc <-df_tbmt_traf6dt$lfc
+names(lfc)<-df_tbmt_traf6dt$ENTREZID
+
+png(file="CNET_TBMT_Traf6dT_Down.png", width=1980, height=1440)
+cnetplot(x_tbmt_traf6dt_down, showCategory =15, foldChange=2^lfc,cex_label_gene = 1.2, cex_label_category = 1.8) + ggtitle("TBMT vs Traf6dT Direct Comparison (Upregulated in Traf6dT)") + theme(plot.title = element_text(size = 40, face = "bold"))
+dev.off()
+```
+
+```{r}
+a<-data.frame(gene = rownames(res_traf6dt_ctrl), res_traf6dt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+b<-data.frame(gene = rownames(res_tbmt_ctrl), res_tbmt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj")%>% dplyr::mutate(minuslogp = -log10(padj), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+
+c <- merge(a,b,by=0) 
+d <- c %>% 
+  dplyr::filter(padj.x<0.1, padj.y<0.1)
+e <- c %>%
+  dplyr::filter(padj.x < 0.1 | padj.y < 0.1)
+
+png(file="signlog.png", width=1980, height=1440)
+ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=0.6)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=0.6)+
+  geom_point(data=d, size=2.25,color="purple", alpha=0.6)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_text_repel(data=subset(c, signlogp.x>5 | signlogp.y>5), aes(label=Row.names), size=6, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)+
+  geom_text_repel(data=subset(c, signlogp.x<(-2) | signlogp.y<(-5)), aes(label=Row.names), size=6, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)+
+  stat_cor(method = "spearman", size=12, label.y = 50, label.x = -16)+
+  annotate("text", x=-10, y=55, label="Spearman's Correlation of all genes", size = 13)+
+  geom_point(aes(x=6, y=-20), color="purple", size=20)+
+  geom_point(aes(x=6, y=-25), color="red", size=20)+
+  geom_point(aes(x=6, y=-30), color="blue", size=20)+
+  annotate("text", x=6.5, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=5.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+
+png(file="LFCcomparison.png", width=1980, height=1440)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=0.6)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=0.6)+
+  geom_point(data=d, size=2.5,color="purple", alpha=0.6)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.1 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=25, face = "bold"))+
+  ylab("TBMT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=25, face = "bold"))+
+  geom_label_repel(data=subset(d, log2FoldChange.x<(-1) & log2FoldChange.y<(-1)), aes(label=Row.names), size=7.5, color="black", nudge_y = 0.05, fontface = "bold", min.segment.length = unit(0.3, "lines"))+
+  geom_label_repel(data=subset(d, log2FoldChange.x>(0.5) & log2FoldChange.y<(0)), aes(label=Row.names), size=7.5, color="black", nudge_y = 0.05, fontface = "bold", min.segment.length = unit(0.3, "lines"))+
+  geom_label_repel(data=subset(e, log2FoldChange.x>2 | log2FoldChange.y<(-2.5)), aes(label=Row.names), size=7.5, color="black", nudge_y = 0.05, fontface = "bold", min.segment.length = unit(0.3, "lines"))+
+  stat_cor(data=d,method = "spearman", size=12, label.y = 5.5, label.x = -2.85, fontface="italic")+
+  annotate("text", x=-1.85, y=6.5, label="Spearman's Correlation of only\ncommonly significant genes", size = 13, fontface="italic")+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")+
+  annotate("text", x=6, y=0.3, label="Both Upregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=6, y=-0.5, label="Traf6dT Upregulated\nTBMT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=0.5, label="TBMT Upregulated\nTraf6dT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=-0.3, label="Both Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  geom_point(aes(x=4.8, y=-2.6), color="purple", size=20)+
+  geom_point(aes(x=4.8, y=-3.1), color="red", size=20)+
+  geom_point(aes(x=4.8, y=-3.6), color="blue", size=20)+
+  annotate("text", x=5, y=-2.6, label="Both", size=11, hjust=0)+
+  annotate("text", x=5, y=-3.1, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=5, y=-3.6, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=4.5, y=-2.1, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()  
+```
+
+```{r}
+Il_genes <- cnt[grep("^Il", rownames(cnt)),]
+Il_genes <- row.names(Il_genes)
+
+
+png(file="signlogWithGenesIL.png", width=1980, height=1440)
+  ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=d, size=2.25,color="purple", alpha=1)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_label_repel(data=subset(c, Row.names %in% Il_genes), aes(label=Row.names), size=8, color="black", nudge_y = 2, fontface="bold", min.segment.length = unit(0, 'lines'), max.overlaps = Inf)+
+  geom_point(aes(x=6, y=-20), color="purple", size=20)+
+  geom_point(aes(x=6, y=-25), color="red", size=20)+
+  geom_point(aes(x=6, y=-30), color="blue", size=20)+
+  annotate("text", x=6.5, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=5.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+
+png(file="LFCcomparisonWithIL.png", width=1980, height=1440)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=d, size=2.5,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.1 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_label_repel(data=subset(d, Row.names %in% Il_genes), aes(label=Row.names), size=8, color="black", nudge_y = 0.05, fontface = "bold", min.segment.length = unit(0.3, "lines"))+
+  annotate("text", x=6.2, y=-2.75, label="p-adj<0.1", size=10, fontface="bold.italic")+
+  geom_point(aes(x=5.5, y=-2.75), color="purple", size=25)+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")+
+  annotate("text", x=6, y=0.3, label="Both Upregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=6, y=-0.5, label="Traf6dT Upregulated\nTBMT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=0.5, label="TBMT Upregulated\nTraf6dT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=-0.3, label="Both Downregulated", size = 9, fontface="bold.italic", color="cyan4")
+dev.off()  
+```
+```{r}
+png(file="signlogWithGenesKrappmann.png", width=1980, height=1440)
+  ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=d, size=2.25,color="purple", alpha=1)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_label_repel(data=subset(c, Row.names %in% genelist), aes(label=Row.names), size=8, color="black", fontface="bold", nudge_y = 2, min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  geom_point(aes(x=6, y=-20), color="purple", size=20)+
+  geom_point(aes(x=6, y=-25), color="red", size=20)+
+  geom_point(aes(x=6, y=-30), color="blue", size=20)+
+  annotate("text", x=6.5, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=5.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+
+png(file="LFCcomparisonWithKrappmann.png", width=1980, height=1440)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=d, size=2.5,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.1 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_label_repel(data=subset(d, Row.names %in% genelist), aes(label=Row.names), size=8, color="black", nudge_y = 0.5, fontface = "bold", min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  annotate("text", x=6.2, y=-2.75, label="p-adj<0.1", size=10, fontface="bold.italic")+
+  geom_point(aes(x=5.5, y=-2.75), color="purple", size=25)+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")+
+  annotate("text", x=6, y=0.3, label="Both Upregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=6, y=-0.5, label="Traf6dT Upregulated\nTBMT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=0.5, label="TBMT Upregulated\nTraf6dT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=-0.3, label="Both Downregulated", size = 9, fontface="bold.italic", color="cyan4")
+dev.off()  
+```
+
+```{r}
+Tnf_genes <- cnt[grep("^Tnf", rownames(cnt)),]
+Tnf_genes <- row.names(Tnf_genes)
+
+png(file="signlogWithGenesTNF.png", width=1980, height=1440)
+  ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=d, size=2.25,color="purple", alpha=1)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_label_repel(data=subset(d, Row.names %in% Tnf_genes), aes(label=Row.names), size=8, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  geom_point(aes(x=6, y=-20), color="purple", size=20)+
+  geom_point(aes(x=6, y=-25), color="red", size=20)+
+  geom_point(aes(x=6, y=-30), color="blue", size=20)+
+  annotate("text", x=6.5, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=5.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+
+png(file="LFCcomparisonWithTNF.png", width=1980, height=1440)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=d, size=2.5,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.1 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_label_repel(data=subset(d, Row.names %in% Tnf_genes), aes(label=Row.names), size=8, color="black", nudge_y = 0.5, fontface = "bold", min.segment.length = unit(0.3, "lines"), max.overlaps = Inf)+
+  annotate("text", x=6.2, y=-2.75, label="p-adj<0.1", size=10, fontface="bold.italic")+
+  geom_point(aes(x=5.5, y=-2.75), color="purple", size=25)+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")+
+  annotate("text", x=6, y=0.3, label="Both Upregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=6, y=-0.5, label="Traf6dT Upregulated\nTBMT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=0.5, label="TBMT Upregulated\nTraf6dT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=-0.3, label="Both Downregulated", size = 9, fontface="bold.italic", color="cyan4")
+dev.off()  
+```
+```{r}
+Nfkb_genes <- cnt[grep("^Nfkb", rownames(cnt)),]
+Nfkb_genes <- as.list(row.names(Nfkb_genes))
+
+Icos_genes <- cnt[grep("^Icos", rownames(cnt)),]
+Icos_genes <- as.list(row.names(Icos_genes))
+
+Irf_genes <- cnt[grep("^Irf", rownames(cnt)),]
+Irf_genes <- as.list(row.names(Irf_genes))
+
+Zc_genes <- cnt[grep("^Zc", rownames(cnt)),]
+Zc_genes <- as.list(row.names(Zc_genes))
+
+Rel_genes <- cnt[grep("^Rel", rownames(cnt)),]
+Rel_genes <- as.list(row.names(Rel_genes))
+
+Traf_genes <- cnt[grep("^Traf", rownames(cnt)),]
+Traf_genes <- as.list(row.names(Traf_genes))
+
+Id_genes <- cnt[grep("^Id", rownames(cnt)),]
+Id_genes <- as.list(row.names(Id_genes))
+
+Ier_genes <- cnt[grep("^Ier", rownames(cnt)),]
+Ier_genes <- as.list(row.names(Ier_genes))
+
+Tm2d_genes <- cnt[grep("^Tm2d", rownames(cnt)),]
+Tm2d_genes <- as.list(row.names(Tm2d_genes))
+
+Metap_genes <- cnt[grep("^Metap", rownames(cnt)),]
+Metap_genes <- as.list(row.names(Metap_genes))
+
+Shcb_genes <- cnt[grep("^Shcb", rownames(cnt)),]
+Shcb_genes <- as.list(row.names(Shcb_genes))
+
+Hhat_genes <- cnt[grep("^Hhat", rownames(cnt)),]
+Hhat_genes <- as.list(row.names(Hhat_genes))
+
+Atf_genes <- cnt[grep("^Atf", rownames(cnt)),]
+Atf_genes <- as.list(row.names(Atf_genes))
+
+Tub_genes <- cnt[grep("^Tub", rownames(cnt)),]
+Tub_genes <- as.list(row.names(Tub_genes))
+
+Maf_genes <- cnt[grep("^Maf", rownames(cnt)),]
+Maf_genes <- as.list(row.names(Maf_genes))
+
+Nlrp_genes <- cnt[grep("^Nlrp", rownames(cnt)),]
+Nlrp_genes <- as.list(row.names(Nlrp_genes))
+
+Cxcl_genes <- cnt[grep("^Cxcl", rownames(cnt)),]
+Cxcl_genes <- as.list(row.names(Cxcl_genes))
+
+Smad_genes <- cnt[grep("^Smad", rownames(cnt)),]
+Smad_genes <- as.list(row.names(Smad_genes))
+
+genelistExtended <- c(Nfkb_genes, Icos_genes, Irf_genes, Zc_genes, Rel_genes, Traf_genes, Id_genes, Ier_genes, Tm2d_genes, Metap_genes, Shcb_genes, Hhat_genes, Atf_genes, Tub_genes, Maf_genes, Nlrp_genes, Cxcl_genes, Smad_genes)
+
+```
+
+```{r}
+png(file="signlogWithGenesExtended.png", width=1980, height=1440)
+  ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=d, size=2.25,color="purple", alpha=1)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_label_repel(data=subset(d, Row.names %in% genelistExtended), aes(label=Row.names), size=8, color="black", nudge_y = 2, fontface="bold", min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  geom_point(aes(x=6, y=-20), color="purple", size=20)+
+  geom_point(aes(x=6, y=-25), color="red", size=20)+
+  geom_point(aes(x=6, y=-30), color="blue", size=20)+
+  annotate("text", x=6.5, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=5.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+
+png(file="LFCcomparisonWithExtended.png", width=1980, height=1440)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=d, size=2.5,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.1 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=25, face = "bold"))+
+  ylab("TBMT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=25, face = "bold"))+
+  geom_label_repel(data=subset(d, Row.names %in% genelistExtended), aes(label=Row.names), size=8, color="black", nudge_y = 0.5, fontface = "bold", min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  annotate("text", x=6.2, y=-2.75, label="p-adj<0.1", size=10, fontface="bold.italic")+
+  geom_point(aes(x=5.5, y=-2.75), color="purple", size=25)+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")+
+  annotate("text", x=6, y=0.3, label="Both Upregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=6, y=-0.5, label="Traf6dT Upregulated\nTBMT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=0.5, label="TBMT Upregulated\nTraf6dT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=-0.3, label="Both Downregulated", size = 9, fontface="bold.italic", color="cyan4")
+dev.off()  
+```
+```{r}
+png(file="signlogWithGenesIGs.png", width=1980, height=1440)
+  ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=d, size=2.25,color="purple", alpha=1)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_label_repel(data=subset(d, Row.names %in% Igh_genes | Row.names %in% Igk_genes), aes(label=Row.names), size=8, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  geom_point(aes(x=12, y=-20), color="purple", size=20)+
+  geom_point(aes(x=12, y=-25), color="red", size=20)+
+  geom_point(aes(x=12, y=-30), color="blue", size=20)+
+  annotate("text", x=13, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=13, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=13, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=11, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+
+png(file="LFCcomparisonWithIGs.png", width=1980, height=1440)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=d, size=2.5,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.1 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_label_repel(data=subset(d, Row.names %in% Igh_genes | Row.names %in% Igk_genes), aes(label=Row.names), size=8, color="black", nudge_y = 0.5, fontface = "bold", min.segment.length = unit(0.3, "lines"), max.overlaps = Inf)+
+  annotate("text", x=6.2, y=-2.75, label="p-adj<0.1", size=10, fontface="bold.italic")+
+  geom_point(aes(x=5.5, y=-2.75), color="purple", size=25)+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")+
+  annotate("text", x=6, y=0.3, label="Both Upregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=6, y=-0.5, label="Traf6dT Upregulated\nTBMT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=0.5, label="TBMT Upregulated\nTraf6dT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=-0.3, label="Both Downregulated", size = 9, fontface="bold.italic", color="cyan4")
+dev.off()  
+```
+```{r}
+png(file="signlogWithGenesPathway.png", width=1980, height=1440)
+  ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=d, size=2.25,color="purple", alpha=1)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_label_repel(data=subset(c, Row.names %in% genelist2), aes(label=Row.names), size=8, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  geom_point(aes(x=6, y=-20), color="purple", size=20)+
+  geom_point(aes(x=6, y=-25), color="red", size=20)+
+  geom_point(aes(x=6, y=-30), color="blue", size=20)+
+  annotate("text", x=6.5, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=5.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+
+png(file="LFCcomparisonWithPathway.png", width=1980, height=1440)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=d, size=2.5,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.1 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_label_repel(data=subset(c, Row.names %in% genelist2), aes(label=Row.names), size=8, color="black", nudge_y = 0.5, fontface = "bold", min.segment.length = unit(0.3, "lines"), max.overlaps = Inf)+
+  annotate("text", x=6.2, y=-2.75, label="p-adj<0.1", size=10, fontface="bold.italic")+
+  geom_point(aes(x=5.5, y=-2.75), color="purple", size=25)+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")+
+  annotate("text", x=6, y=0.3, label="Both Upregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=6, y=-0.5, label="Traf6dT Upregulated\nTBMT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=0.5, label="TBMT Upregulated\nTraf6dT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=-0.3, label="Both Downregulated", size = 9, fontface="bold.italic", color="cyan4")
+dev.off()  
+```
+
+
+```{r}
+traf6list<-data.frame(gene = rownames(res_traf6dt_ctrl), res_traf6dt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), "LFCminuslogp" = log2FoldChange*minuslogp) %>% rownames_to_column(var = "gene")
+
+tbmtlist<-data.frame(gene = rownames(res_tbmt_ctrl), res_tbmt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), "LFCminuslogp" = log2FoldChange*minuslogp) %>% rownames_to_column(var = "gene")
+
+commonlist <- left_join(traf6list, tbmtlist, by="gene")
+
+commonlist <- commonlist %>% mutate(Significance = ifelse(commonlist$padj.x<=0.1 & commonlist$padj.y<=0.1, "Both", ifelse(commonlist$padj.x<=0.1 & commonlist$padj.y>0.1, "Only Traf6dT", ifelse(commonlist$padj.x>0.1 & commonlist$padj.y<=0.1, "Only TBMT", "Neither"))))
+
+commonlist_excel <- commonlist %>%
+  dplyr::select(gene, log2FoldChange.x, padj.x, log2FoldChange.y, padj.y, Significance) %>%
+  dplyr::rename("Gene" = "gene", "LFC (Traf6dT vs Control)" = "log2FoldChange.x", "p-adj (Traf6dT vs Control)" = "padj.x", "LFC (TBMT vs Control)" = "log2FoldChange.y", "p-adj (TBMT vs Control)" = "padj.y")
+
+write.xlsx(commonlist_excel, "Cross Comparison List.xlsx", overwrite = TRUE)
+```
+
+```{r}
+library("matrixStats")
+x_traf6dt_up_df <- x_traf6dt_up@result
+x_tbmt_up_df <- x_tbmt_up@result
+
+Reactome_commonUp <- left_join(x_traf6dt_up_df, x_tbmt_up_df, by="ID")
+Reactome_commonUp <- Reactome_commonUp %>% mutate(Significance = ifelse(Reactome_commonUp$qvalue.x<=0.1 & Reactome_commonUp$qvalue.y<=0.1, "Both", ifelse(Reactome_commonUp$qvalue.x<=0.1 & Reactome_commonUp$qvalue.y>0.1, "Only Traf6dT", ifelse(Reactome_commonUp$qvalue.x>0.1 & Reactome_commonUp$qvalue.y<=0.1, "Only TBMT", "Neither"))))
+Reactome_commonUp$Significance <- as.factor(Reactome_commonUp$Significance)
+
+Reactome_commonUp_new <- Reactome_commonUp %>%
+  dplyr::filter(Significance != "Neither") %>%
+  dplyr::arrange(Significance) %>%
+  dplyr::select(ID, Description.x, qvalue.x, geneID.x, qvalue.y, geneID.y, Significance)
+
+Reactome_commonUp_new$qval_maximum = rowMaxs(as.matrix(Reactome_commonUp_new[,c(3,5)]))
+
+Reactome_Both <- Reactome_commonUp_new %>%
+  dplyr::filter(Significance == "Both") %>%
+  dplyr::arrange(qval_maximum)
+
+Reactome_TBMT <- Reactome_commonUp_new %>%
+  dplyr::filter(Significance == "Only TBMT") %>% 
+  dplyr::arrange(qvalue.y)
+
+Reactome_Traf6dT <- Reactome_commonUp_new %>%
+  dplyr::filter(Significance == "Only Traf6dT") %>% 
+  dplyr::arrange(qvalue.x)
+
+Reactome_TBMT_Traf6dT <- bind_rows(Reactome_TBMT, Reactome_Traf6dT)
+Reactome_commonUp_new <- bind_rows(Reactome_Both, Reactome_TBMT_Traf6dT)
+  
+
+Reactome_commonUp_Excel <- Reactome_commonUp_new %>% 
+  dplyr::select(-qval_maximum) %>%
+  dplyr::rename("Description" = "Description.x", "p-adj Traf6dT" = "qvalue.x", "p-adj TBMT" = "qvalue.y", "List of upregulated genes in this pathway (Traf6dT vs Control)" = "geneID.x", "List of upregulated genes in this pathway (TBMT vs Control)" = "geneID.y") 
+
+write.xlsx(Reactome_commonUp_Excel, "Reactome Common Up.xlsx", overwrite = TRUE)
+```
+
+```{r}
+x_traf6dt_down_df <- x_traf6dt_down@result
+x_tbmt_down_df <- x_tbmt_down@result
+
+Reactome_commonDown <- left_join(x_traf6dt_down_df, x_tbmt_down_df, by="ID")
+Reactome_commonDown <- Reactome_commonDown %>% mutate(Significance = ifelse(Reactome_commonDown$qvalue.x<=0.1 & Reactome_commonDown$qvalue.y<=0.1, "Both", ifelse(Reactome_commonDown$qvalue.x<=0.1 & Reactome_commonDown$qvalue.y>0.1, "Only Traf6dT", ifelse(Reactome_commonDown$qvalue.x>0.1 & Reactome_commonDown$qvalue.y<=0.1, "Only TBMT", "Neither"))))
+Reactome_commonDown$Significance <- as.factor(Reactome_commonDown$Significance)
+
+Reactome_commonDown_Excel <- Reactome_commonDown %>%
+  dplyr::filter(Significance != "Neither") %>%
+  dplyr::arrange(Significance) %>%
+  dplyr::select(ID, Description.x, qvalue.x, geneID.x, qvalue.y, geneID.y, Significance) %>%
+  dplyr::rename("Description" = "Description.x", "p-adj Traf6dT" = "qvalue.x", "p-adj TBMT" = "qvalue.y", "List of downregulated genes in this pathway (Traf6dT vs Control)" = "geneID.x", "List of downregulated genes in this pathway (TBMT vs Control)" = "geneID.y")
+write.xlsx(Reactome_commonDown_Excel, "Reactome Common Down.xlsx", overwrite = TRUE)
+```
+
+```{r}
+png(file="CommonReactome_Up.png", width=1980, height=1440)
+ggplot(Reactome_commonUp, aes(x=(-log10(qvalue.x)), y=(-log10(qvalue.y))))+
+  geom_point(data=subset(Reactome_commonUp,Significance=="Both"),
+             colour = "purple",size = 10,alpha = 0.7) +
+  geom_point(data=subset(Reactome_commonUp,Significance=="Only Traf6dT"),
+             colour = "blue", size = 10,alpha = 0.7) +
+  geom_point(data=subset(Reactome_commonUp,Significance=="Only TBMT"),
+             colour = "red", size = 10,alpha = 0.7) +
+  theme(legend.key.size = unit(3, 'cm'), legend.text = element_text(size=20, face = "bold"), legend.title = element_text(size=24, face="bold"))+
+  scale_color_manual("Significance", values = c("blue","red","purple"),
+                     breaks = c("Only Traf6dT","Only TBMT","Both")) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line(arrow = arrow())) + 
+  ggtitle("Common Reactome Pathways (Upregulated)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (-log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (-log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_label_repel(data=subset(Reactome_commonUp, Significance== "Both"), aes(label=Description.x), size=7, nudge_y=0.15, nudge_x=2, color="black", fontface="bold", min.segment.length = unit(0, "lines"), max.overlaps = 12.5, angle=45)+
+  geom_point(aes(x=16, y=0.9), color="purple", size=20)+
+  geom_point(aes(x=16, y=0.6), color="red", size=20)+
+  geom_point(aes(x=16, y=0.3), color="blue", size=20)+
+  annotate("text", x=16.3, y=0.9, label="Both", size=11, hjust=0)+
+  annotate("text", x=16.3, y=0.6, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=16.3, y=0.3, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=15.5, y=1.2, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+```
+```{r}
+png(file="CommonReactome_Down.png", width=1980, height=1440)
+ggplot(Reactome_commonDown, aes(x=(-log10(qvalue.x)), y=(-log10(qvalue.y))))+
+  geom_point(data=subset(Reactome_commonDown,Significance=="Both"),
+             colour = "purple",size = 10,alpha = 0.7) +
+  geom_point(data=subset(Reactome_commonDown,Significance=="Only Traf6dT"),
+             colour = "blue", size = 10,alpha = 0.7) +
+  geom_point(data=subset(Reactome_commonDown,Significance=="Only TBMT"),
+             colour = "red", size = 10,alpha = 0.7) +
+  theme(legend.key.size = unit(3, 'cm'), legend.text = element_text(size=20, face = "bold"), legend.title = element_text(size=24, face="bold"))+
+  scale_color_manual("Significance", values = c("blue","red","purple"),
+                     breaks = c("Only Traf6dT","Only TBMT","Both")) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line(arrow = arrow())) + 
+  ggtitle("Common Reactome Pathways (Downregulated)")+
+  theme(plot.title = element_text(size = 50, face = "bold"))+
+  xlab("Traf6dT vs Control (-log10(p-adj))")+
+  theme(axis.title = element_text(size = 30, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (-log10(p-adj))")+
+  theme(axis.title = element_text(size = 30, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_label_repel(data=subset(Reactome_commonDown, Significance == "Both" | Significance== "Only TBMT" | Significance == "Only Traf6dT"), aes(label=Description.x), size=7, color="black", fontface="bold", nudge_y = 0.2, min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  geom_point(aes(x=4, y=1.2), color="purple", size=20)+
+  geom_point(aes(x=4, y=1.1), color="red", size=20)+
+  geom_point(aes(x=4, y=1), color="blue", size=20)+
+  annotate("text", x=4.1, y=1.2, label="Both", size=11, hjust=0)+
+  annotate("text", x=4.1, y=1.1, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=4.1, y=1, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=3.9, y=1.3, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+```
+
+```{r}
+#If you made a genelist from raw table pre-filtering
+for (i in genelist) {
+  if (i %in% row.names(vsdMat)) #Choose the ones that remained after DeSEQ
+  j <- plotCounts(dds, gene=i, intgroup="Genotype", returnData = TRUE)
+  temp_plot <- ggplot(j, aes(x=Genotype, y=count))+
+    geom_boxplot(aes(fill = factor(Genotype)),alpha = 0.7,outlier.shape = NA)+
+    geom_point(position = position_jitter(width = 0.1, height = 0))+
+    labs(x = "Genotype",
+             y="Normalized Counts (log10 transformed)",
+             title = i)+ 
+    scale_fill_manual(breaks = c("Control","TBMT", "Traf6dT"),
+                          values = c("grey","red","blue")) +
+    theme_classic() +
+        theme(axis.text = element_text(size=12),
+              title = element_text(size=12)) +
+        guides(fill = FALSE)+
+    scale_y_log10()
+   ggsave(temp_plot,path = "Plots_from_genelist",file = paste0(i,".png"),
+             width=4, height = 4.5, units="in")}
+```
+
+```{r}
+for (i in genelist2) {
+  if (i %in% row.names(vsdMat)) #Choose the ones that remained after DeSEQ
+  j <- plotCounts(dds, gene=i, intgroup="Genotype", returnData = TRUE)
+  temp_plot <- ggplot(j, aes(x=Genotype, y=count))+
+    geom_boxplot(aes(fill = factor(Genotype)),alpha = 0.7,outlier.shape = NA)+
+    geom_point(position = position_jitter(width = 0.1, height = 0))+
+    labs(x = "Genotype",
+             y="Normalized Counts (log10 transformed)",
+             title = i)+ 
+    scale_fill_manual(breaks = c("Control","TBMT", "Traf6dT"),
+                          values = c("grey","red","blue")) +
+    theme_classic() +
+        theme(axis.text = element_text(size=12),
+              title = element_text(size=12)) +
+        guides(fill = FALSE)+
+    scale_y_log10()
+   ggsave(temp_plot,path = "Plots_from_genelist2",file = paste0(i,".png"),
+             width=4, height = 4.5, units="in")}
+```
+
+```{r}
+for (i in Il_genes) {
+  if (i %in% row.names(vsdMat)) #Choose the ones that remained after DeSEQ
+  j <- plotCounts(dds, gene=i, intgroup="Genotype", returnData = TRUE)
+  temp_plot <- ggplot(j, aes(x=Genotype, y=count))+
+    geom_boxplot(aes(fill = factor(Genotype)),alpha = 0.7,outlier.shape = NA)+
+    geom_point(position = position_jitter(width = 0.1, height = 0))+
+    labs(x = "Genotype",
+             y="Normalized Counts (log10 transformed)",
+             title = i)+ 
+    scale_fill_manual(breaks = c("Control","TBMT", "Traf6dT"),
+                          values = c("grey","red","blue")) +
+    theme_classic() +
+        theme(axis.text = element_text(size=12),
+              title = element_text(size=12)) +
+        guides(fill = FALSE)+
+    scale_y_log10()
+   ggsave(temp_plot,path = "Plots_from_Ilgenes",file = paste0(i,".png"),
+             width=4, height = 4.5, units="in")}
+```
+
+```{r}
+Igh_genes <- cnt[grep("^Igh", rownames(cnt)),]
+Igh_genes <- row.names(Igh_genes)
+
+for (i in Igh_genes) {
+  if (i %in% row.names(vsdMat)) #Choose the ones that remained after DeSEQ
+  j <- plotCounts(dds, gene=i, intgroup="Genotype", returnData = TRUE)
+  temp_plot <- ggplot(j, aes(x=Genotype, y=count))+
+    geom_boxplot(aes(fill = factor(Genotype)),alpha = 0.7,outlier.shape = NA)+
+    geom_point(position = position_jitter(width = 0.1, height = 0))+
+    labs(x = "Genotype",
+             y="Normalized Counts (log10 transformed)",
+             title = i)+ 
+    scale_fill_manual(breaks = c("Control","TBMT", "Traf6dT"),
+                          values = c("grey","red","blue")) +
+    theme_classic() +
+        theme(axis.text = element_text(size=12),
+              title = element_text(size=12)) +
+        guides(fill = FALSE)+
+    scale_y_log10()
+   ggsave(temp_plot,path = "Plots_from_Ighgenes",file = paste0(i,".png"),
+             width=4, height = 4.5, units="in")}
+```
+
+```{r}
+Igk_genes <- cnt[grep("^Igk", rownames(cnt)),]
+Igk_genes <- row.names(Igk_genes)
+
+for (i in Igk_genes) {
+  if (i %in% row.names(vsdMat)) #Choose the ones that remained after DeSEQ
+  j <- plotCounts(dds, gene=i, intgroup="Genotype", returnData = TRUE)
+  temp_plot <- ggplot(j, aes(x=Genotype, y=count))+
+    geom_boxplot(aes(fill = factor(Genotype)),alpha = 0.7,outlier.shape = NA)+
+    geom_point(position = position_jitter(width = 0.1, height = 0))+
+    labs(x = "Genotype",
+             y="Normalized Counts (log10 transformed)",
+             title = i)+ 
+    scale_fill_manual(breaks = c("Control","TBMT", "Traf6dT"),
+                          values = c("grey","red","blue")) +
+    theme_classic() +
+        theme(axis.text = element_text(size=12),
+              title = element_text(size=12)) +
+        guides(fill = FALSE)+
+    scale_y_log10()
+   ggsave(temp_plot,path = "Plots_from_Igkgenes",file = paste0(i,".png"),
+             width=4, height = 4.5, units="in")}
+```
+
+```{r}
+for (i in genelistExtended) {
+  if (i %in% row.names(vsdMat)) #Choose the ones that remained after DeSEQ
+  j <- plotCounts(dds, gene=i, intgroup="Genotype", returnData = TRUE)
+  temp_plot <- ggplot(j, aes(x=Genotype, y=count))+
+    geom_boxplot(aes(fill = factor(Genotype)),alpha = 0.7,outlier.shape = NA)+
+    geom_point(position = position_jitter(width = 0.1, height = 0))+
+    labs(x = "Genotype",
+             y="Normalized Counts (log10 transformed)",
+             title = i)+ 
+    scale_fill_manual(breaks = c("Control","TBMT", "Traf6dT"),
+                          values = c("grey","red","blue")) +
+    theme_classic() +
+        theme(axis.text = element_text(size=12),
+              title = element_text(size=12)) +
+        guides(fill = FALSE)+
+    scale_y_log10()
+   ggsave(temp_plot,path = "Plots_from_genelistExtended",file = paste0(i,".png"),
+             width=4, height = 4.5, units="in")}
+```
+
+```{r}
+a<-data.frame(gene = rownames(res_traf6dt_ctrl), res_traf6dt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+b<-data.frame(gene = rownames(res_tbmt_ctrl), res_tbmt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj")%>% dplyr::mutate(minuslogp = -log10(padj), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+
+c <- merge(a,b,by=0) 
+d <- c %>% 
+  dplyr::filter(padj.x<0.1, padj.y<0.1)
+
+png(file="signlogUp.png", width=1980, height=1440)
+ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(c, signlogp.x<(-log10(0.1)) & signlogp.y>(-log10(0.1))), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, signlogp.x>(-log10(0.1)) & signlogp.y<(-log10(0.1))), size=2.25,color="blue", alpha=1)+
+  geom_point(data=subset(c, signlogp.x>(-log10(0.1)) & signlogp.y>(-log10(0.1))), size=2.25,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT Cross Comparison (Upregulated)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_text_repel(data=subset(c, signlogp.x>5 | signlogp.y>5), aes(label=Row.names), size=6, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)+
+  geom_point(aes(x=6, y=-20), color="purple", size=20)+
+  geom_point(aes(x=6, y=-25), color="red", size=20)+
+  geom_point(aes(x=6, y=-30), color="blue", size=20)+
+  annotate("text", x=6.5, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=5.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+
+png(file="signlogDown.png", width=1980, height=1440)
+ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(c, signlogp.x>(log10(0.1)) & signlogp.y<(log10(0.1))), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, signlogp.x<(log10(0.1)) & signlogp.y>(log10(0.1))), size=2.25,color="blue", alpha=1)+
+  geom_point(data=subset(c, signlogp.x<(log10(0.1)) & signlogp.y<(log10(0.1))), size=2.25,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT Cross Comparison (Downregulated)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_text_repel(data=subset(c, signlogp.x<(-2) | signlogp.y<(-5)), aes(label=Row.names), size=6, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)+
+  geom_point(aes(x=6, y=-20), color="purple", size=20)+
+  geom_point(aes(x=6, y=-25), color="red", size=20)+
+  geom_point(aes(x=6, y=-30), color="blue", size=20)+
+  annotate("text", x=6.5, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=5.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+```
+```{r}
+Ifn_genes <- cnt[grep("^Ifn", rownames(cnt)),]
+Ifn_genes <- row.names(Ifn_genes)
+
+for (i in Ifn_genes) {
+  if (i %in% row.names(vsdMat)) #Choose the ones that remained after DeSEQ
+  j <- plotCounts(dds, gene=i, intgroup="Genotype", returnData = TRUE)
+  temp_plot <- ggplot(j, aes(x=Genotype, y=count))+
+    geom_boxplot(aes(fill = factor(Genotype)),alpha = 0.7,outlier.shape = NA)+
+    geom_point(position = position_jitter(width = 0.1, height = 0))+
+    labs(x = "Genotype",
+             y="Normalized Counts (log10 transformed)",
+             title = i)+ 
+    scale_fill_manual(breaks = c("Control","TBMT", "Traf6dT"),
+                          values = c("grey","red","blue")) +
+    theme_classic() +
+        theme(axis.text = element_text(size=12),
+              title = element_text(size=12)) +
+        guides(fill = FALSE)+
+    scale_y_log10()
+   ggsave(temp_plot,path = "Plots_from_Ifngenes",file = paste0(i,".png"),
+             width=4, height = 4.5, units="in")}
+```
+
+```{r}
+genelist3 <- c("Mapk14", "Cd55", "RhoA")
+for (i in genelist3) {
+  if (i %in% row.names(vsdMat)) #Choose the ones that remained after DeSEQ
+  j <- plotCounts(dds, gene=i, intgroup="Genotype", returnData = TRUE)
+  temp_plot <- ggplot(j, aes(x=Genotype, y=count))+
+    geom_boxplot(aes(fill = factor(Genotype)),alpha = 0.7,outlier.shape = NA)+
+    geom_point(position = position_jitter(width = 0.1, height = 0))+
+    labs(x = "Genotype",
+             y="Normalized Counts (log10 transformed)",
+             title = i)+ 
+    scale_fill_manual(breaks = c("Control","TBMT", "Traf6dT"),
+                          values = c("grey","red","blue")) +
+    theme_classic() +
+        theme(axis.text = element_text(size=12),
+              title = element_text(size=12)) +
+        guides(fill = FALSE)+
+    scale_y_log10()
+   ggsave(temp_plot,path = "Plots_from_genelist3",file = paste0(i,".png"),
+             width=4, height = 4.5, units="in")}
+```
+
+```{r}
+tbmt_traf6dt_list<-data.frame(gene = rownames(res_tbmt_traf6dt), res_tbmt_traf6dt,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), "LFCminuslogp" = log2FoldChange*minuslogp) %>% rownames_to_column(var = "gene")
+
+png(file="TBMTvsTraf6dT_Volcano.png", width=1980, height=1440)
+ggplot(tbmt_traf6dt_list, aes(x=log2FoldChange, y=(minuslogp)))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(tbmt_traf6dt_list, minuslogp>(-log10(0.1))), size=2.25,color="darkorange1", alpha=1)+
+  geom_point(data=subset(tbmt_traf6dt_list, minuslogp>(-log10(0.1)) & abs(log2FoldChange)>(1)), size=2.25,color="red3", alpha=1)+
+  geom_point(data=subset(tbmt_traf6dt_list, minuslogp<(-log10(0.1)) & abs(log2FoldChange)>(1)), size=2.25,color="yellowgreen", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT Direct Comparison")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  #scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  #scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Log2FoldChange")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("-log10(p-adj)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = 1, linetype="dashed")+
+  geom_vline(xintercept = -1, linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_text_repel(data=subset(tbmt_traf6dt_list, minuslogp>5 | abs(log2FoldChange)>2), aes(label=gene), size=6, color="black", nudge_y = 0.5, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)+
+  geom_point(aes(x=-3.5, y=28.5), color="red3", size=20)+
+  geom_point(aes(x=-3.5, y=27), color="darkorange1", size=20)+
+  geom_point(aes(x=-3.5, y=25.5), color="yellowgreen", size=20)+
+  annotate("text", x=-3.3, y=28.55, label="p-adj<0.1 |LFC|>1", size=12, hjust=0)+
+  annotate("text", x=-3.3, y=27.05, label="p-adj<0.1 |LFC|<1", size=12, hjust=0)+
+  annotate("text", x=-3.3, y=25.55, label="p-adj>0.1 |LFC|>1", size=12, hjust=0)
+dev.off()
+
+```
+```{r}
+tbmt_ctrl_list<-data.frame(gene = rownames(res_tbmt_ctrl), res_tbmt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), "LFCminuslogp" = log2FoldChange*minuslogp) %>% rownames_to_column(var = "gene")
+
+png(file="TBMTvsCtrl_Volcano.png", width=1980, height=1440)
+ggplot(tbmt_ctrl_list, aes(x=log2FoldChange, y=(minuslogp)))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(tbmt_ctrl_list, minuslogp>(-log10(0.1))), size=2.25,color="darkorange1", alpha=1)+
+  geom_point(data=subset(tbmt_ctrl_list, minuslogp>(-log10(0.1)) & abs(log2FoldChange)>(1)), size=2.25,color="red3", alpha=1)+
+  geom_point(data=subset(tbmt_ctrl_list, minuslogp<(-log10(0.1)) & abs(log2FoldChange)>(1)), size=2.25,color="yellowgreen", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Control")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  #scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  #scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Log2FoldChange")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("-log10(p-adj)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = 1, linetype="dashed")+
+  geom_vline(xintercept = -1, linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_text_repel(data=subset(tbmt_ctrl_list, minuslogp>10 | abs(log2FoldChange)>2.5), aes(label=gene), size=6, color="black", nudge_y = 0.5, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)+
+  geom_point(aes(x=-3.3, y=59), color="red3", size=20)+
+  geom_point(aes(x=-3.3, y=56), color="darkorange1", size=20)+
+  geom_point(aes(x=-3.3, y=53), color="yellowgreen", size=20)+
+  annotate("text", x=-3.05, y=59.05, label="p-adj<0.1 |LFC|>1", size=12, hjust=0)+
+  annotate("text", x=-3.05, y=56.05, label="p-adj<0.1 |LFC|<1", size=12, hjust=0)+
+  annotate("text", x=-3.05, y=53.05, label="p-adj>0.1 |LFC|>1", size=12, hjust=0)
+dev.off()
+
+```
+
+```{r}
+traf6dt_ctrl_list<-data.frame(gene = rownames(res_traf6dt_ctrl), res_traf6dt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), "LFCminuslogp" = log2FoldChange*minuslogp) %>% rownames_to_column(var = "gene")
+
+png(file="Traf6dTvsCtrl_Volcano.png", width=1980, height=1440)
+ggplot(traf6dt_ctrl_list, aes(x=log2FoldChange, y=(minuslogp)))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(traf6dt_ctrl_list, minuslogp>(-log10(0.1))), size=2.25,color="darkorange1", alpha=1)+
+  geom_point(data=subset(traf6dt_ctrl_list, minuslogp>(-log10(0.1)) & abs(log2FoldChange)>(1)), size=2.25,color="red3", alpha=1)+
+  geom_point(data=subset(traf6dt_ctrl_list, minuslogp<(-log10(0.1)) & abs(log2FoldChange)>(1)), size=2.25,color="yellowgreen", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("Traf6dT vs Control")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  #scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  #scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Log2FoldChange")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("-log10(p-adj)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = 1, linetype="dashed")+
+  geom_vline(xintercept = -1, linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_text_repel(data=subset(traf6dt_ctrl_list, minuslogp>5 | abs(log2FoldChange)>2), aes(label=gene), size=6, color="black", nudge_y = 0.5, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)+
+  geom_point(aes(x=3, y=18), color="red3", size=20)+
+  geom_point(aes(x=3, y=17), color="darkorange1", size=20)+
+  geom_point(aes(x=3, y=16), color="yellowgreen", size=20)+
+  annotate("text", x=3.25, y=18.05, label="p-adj<0.1 |LFC|>1", size=12, hjust=0)+
+  annotate("text", x=3.25, y=17.05, label="p-adj<0.1 |LFC|<1", size=12, hjust=0)+
+  annotate("text", x=3.25, y=16.05, label="p-adj>0.1 |LFC|>1", size=12, hjust=0)
+dev.off()
+
+```
+```{r}
+png(file="signlogWithGenesIFNs.png", width=1980, height=1440)
+  ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=d, size=2.25,color="purple", alpha=1)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_label_repel(data=subset(d, Row.names %in% Ifn_genes), aes(label=Row.names), size=8, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  geom_point(aes(x=6, y=-20), color="purple", size=20)+
+  geom_point(aes(x=6, y=-25), color="red", size=20)+
+  geom_point(aes(x=6, y=-30), color="blue", size=20)+
+  annotate("text", x=6.5, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=5.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+
+png(file="LFCcomparisonWithIFNs.png", width=1980, height=1440)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=d, size=2.5,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.1 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_label_repel(data=subset(d, Row.names %in% Ifn_genes), aes(label=Row.names), size=8, color="black", nudge_y = 0.5, fontface = "bold", min.segment.length = unit(0.3, "lines"), max.overlaps = Inf)+
+  annotate("text", x=6.2, y=-2.75, label="p-adj<0.1", size=10, fontface="bold.italic")+
+  geom_point(aes(x=5.5, y=-2.75), color="purple", size=25)+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")+
+  annotate("text", x=6, y=0.3, label="Both Upregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=6, y=-0.5, label="Traf6dT Upregulated\nTBMT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=0.5, label="TBMT Upregulated\nTraf6dT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=-0.3, label="Both Downregulated", size = 9, fontface="bold.italic", color="cyan4")
+dev.off()  
+```
+
+```{r}
+Tgf_genes <- cnt[grep("^Tgf", rownames(cnt)),]
+Tgf_genes <- row.names(Tgf_genes)
+
+png(file="signlogWithGenesTGFs.png", width=1980, height=1440)
+  ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=d, size=2.25,color="purple", alpha=1)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_label_repel(data=subset(d, Row.names %in% Tgf_genes), aes(label=Row.names), size=8, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  geom_point(aes(x=12, y=-20), color="purple", size=20)+
+  geom_point(aes(x=12, y=-25), color="red", size=20)+
+  geom_point(aes(x=12, y=-30), color="blue", size=20)+
+  annotate("text", x=13, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=13, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=13, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=11, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+
+png(file="LFCcomparisonWithTGFs.png", width=1980, height=1440)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=d, size=2.5,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.1 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_label_repel(data=subset(d, Row.names %in% Tgf_genes), aes(label=Row.names), size=8, color="black", nudge_y = 0.5, fontface = "bold", min.segment.length = unit(0.3, "lines"), max.overlaps = Inf)+
+  annotate("text", x=6.2, y=-2.75, label="p-adj<0.1", size=10, fontface="bold.italic")+
+  geom_point(aes(x=5.5, y=-2.75), color="purple", size=25)+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")+
+  annotate("text", x=6, y=0.3, label="Both Upregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=6, y=-0.5, label="Traf6dT Upregulated\nTBMT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=0.5, label="TBMT Upregulated\nTraf6dT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=-0.3, label="Both Downregulated", size = 9, fontface="bold.italic", color="cyan4")
+dev.off()  
+```
+
+```{r}
+res_tbmt_traf6dt_excel <-data.frame(gene = rownames(res_tbmt_traf6dt), res_tbmt_traf6dt,
+stringsAsFactors = F) %>%
+  dplyr::select(gene, log2FoldChange, padj) %>%
+  dplyr::rename("Gene" = "gene", "LFC (TBMT vs Traf6dT)" = "log2FoldChange", "p-adj" = "padj")
+
+write.xlsx(res_tbmt_traf6dt_excel, "Direct Comparison of Mutants.xlsx", overwrite = TRUE)
+```
+
+```{r}
+write.xlsx(cnt.filt, "Filtered Counts.xlsx", overwrite = TRUE)
+```
+
+```{r}
+library(stringr)
+library(HGNChelper)
+tpm3<-tpm %>% ungroup() %>% group_by(GeneID)
+cnt.tib.new <- tpm3 %>% dplyr::select(GeneID,sample,cnt) %>% pivot_wider(names_from = sample,
+values_from = cnt )
+
+
+
+cnt.filt_human<-as.matrix(cnt.tib.new[,-1]) 
+humannames <- str_to_upper(rownames(cnt))
+checknames <- checkGeneSymbols(humannames)
+rownames(cnt.filt_human)<-humannames
+cnt.filt_human_df <- as.data.frame(cnt.filt_human)
+cnt.filt_human_df <- tibble::rownames_to_column(cnt.filt_human_df, "Suggested.Symbol")
+
+newmatrix <- left_join(cnt.filt_human_df, checknames, by="Suggested.Symbol")
+
+newmatrix <- as.data.frame(newmatrix) %>%
+  dplyr::select(-x, -Approved)
+
+newmatrixCounts <- newmatrix[,2:16]
+newmatrixCounts <- data.matrix(newmatrixCounts)
+rownames(newmatrixCounts) <- newmatrix$Suggested.Symbol
+newmatrixCounts <- newmatrixCounts[,order]
+```
+
+```{r}
+library(immunedeconv)
+quantiseq <- immunedeconv::deconvolute(newmatrixCounts, "quantiseq")
+
+order_deconv <- c("cell_type", "Sample_MUC26944","Sample_MUC26945","Sample_MUC26951","Sample_MUC26952","Sample_MUC26953", "Sample_MUC26950", "Sample_MUC26954", "Sample_MUC26956", "Sample_MUC26957", "Sample_MUC26958", "Sample_MUC26946", "Sample_MUC26947", "Sample_MUC26948", "Sample_MUC26949", "Sample_MUC26955")
+
+quantiseq <- quantiseq[,order_deconv]
+
+quantiseq %>%
+  gather(sample, fraction, -cell_type)%>%
+  # plot as stacked bar chart
+  mutate(sample = factor(sample, levels=order_deconv))%>%
+  ggplot(aes(x=sample, y=fraction, fill=cell_type)) +
+    geom_bar(stat='identity') +
+    coord_flip() +
+    scale_fill_brewer(palette="Paired") +
+    scale_x_discrete(limits = rev(levels(quantiseq)))
+
+res_mcp_counter = deconvolute(newmatrixCounts, "mcp_counter")
+res_mcp_counter %>%
+  gather(sample, score, -cell_type) %>%
+  mutate(sample = factor(sample, levels=order_deconv))%>%
+  ggplot(aes(x=sample, y=score, color=cell_type)) +
+    geom_point(size=4) +
+    facet_wrap(~cell_type, scales="free_x", ncol=3) +
+    scale_color_brewer(palette="Paired", guide=FALSE) +
+    coord_flip() +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+```{r}
+newmatrixCounts_tbmt <- newmatrixCounts[,1:5]
+newmatrixCounts_traf6dt <- newmatrixCounts[,6:10]
+newmatrixCounts_ctrl <- newmatrixCounts[,11:15]
+```
+
+```{r}
+xcell_tbmt <- immunedeconv::deconvolute(newmatrixCounts_tbmt,"xcell")
+xcell_tbmt$mean.tbmt <- apply(xcell_tbmt[,-1],1,mean)
+
+xcell_traf6dt <- immunedeconv::deconvolute(newmatrixCounts_traf6dt,"xcell")
+xcell_traf6dt$mean.traf6dt <- apply(xcell_traf6dt[,-1],1,mean)
+
+xcell_ctrl <- immunedeconv::deconvolute(newmatrixCounts_ctrl,"xcell")
+xcell_ctrl$mean.ctrl <- apply(xcell_ctrl[,-1],1,mean)
+
+xcell_tbmt_ctrl <- immunedeconv::deconvolute(newmatrixCounts,"xcell")
+xcell_tbmt_ctrl$log2FC <- log2(xcell_tbmt$mean.tbmt/xcell_ctrl$mean.ctrl)
+xcell_tbmt_ctrl$p.value <- rep(1,nrow(xcell_tbmt_ctrl))
+
+for(i in 1:nrow(xcell_tbmt_ctrl)){
+  xcell_tbmt_ctrl[i,]$p.value <- t.test(xcell_tbmt[i,-1],xcell_ctrl[i,-1])$p.value}
+
+xcell_tbmt_ctrl <- xcell_tbmt_ctrl[order(xcell_tbmt_ctrl$p.value,decreasing = T),]
+xcell_tbmt_ctrl$p.adjusted <- p.adjust(xcell_tbmt_ctrl$p.value,method = "BH")
+
+xcell_traf6dt_ctrl <- immunedeconv::deconvolute(newmatrixCounts,"xcell")
+xcell_traf6dt_ctrl$log2FC <- log2(xcell_traf6dt$mean.traf6dt/xcell_ctrl$mean.ctrl)
+xcell_traf6dt_ctrl$p.value <- rep(1,nrow(xcell_traf6dt_ctrl))
+
+for(i in 1:nrow(xcell_traf6dt_ctrl)){
+  xcell_traf6dt_ctrl[i,]$p.value <- t.test(xcell_traf6dt[i,-1],xcell_ctrl[i,-1])$p.value}
+
+xcell_traf6dt_ctrl <- xcell_traf6dt_ctrl[order(xcell_traf6dt_ctrl$p.value,decreasing = T),]
+xcell_traf6dt_ctrl$p.adjusted <- p.adjust(xcell_traf6dt_ctrl$p.value,method = "BH")
+
+write.xlsx(xcell_traf6dt_ctrl, "Traf6dT Cell Type Enrichment.xlsx", overwrite = TRUE)
+write.xlsx(xcell_tbmt_ctrl, "TBMT Cell Type Enrichment.xlsx", overwrite = TRUE)
+```
+
+
+```{r}
+epic <- immunedeconv::deconvolute(newmatrixCounts, "epic")
+
+epic %>%
+  gather(sample, fraction, -cell_type) %>%
+  mutate(sample = factor(sample, levels=order_deconv))%>%
+  # plot as stacked bar chart
+  ggplot(aes(x=sample, y=fraction, fill=cell_type)) +
+    geom_bar(stat='identity') +
+    coord_flip() +
+    scale_fill_brewer(palette="Paired") +
+    scale_x_discrete(limits = rev(levels(epic)))
+```
+
+```{r}
+xcell <- immunedeconv::deconvolute(newmatrixCounts, "xcell")
+
+library(RColorBrewer)
+
+mycolors <- colorRampPalette(brewer.pal(8, "Set2"))(39)
+
+xcell %>%
+  gather(sample, enrichment_score, -cell_type) %>%
+  mutate(sample = factor(sample, levels=order_deconv))%>%
+  # plot as stacked bar chart
+  ggplot(aes(x=sample, y=enrichment_score, fill=cell_type)) +
+    geom_bar(stat='identity') +
+    coord_flip() +
+    scale_fill_manual(values=mycolors) 
+```
+
+```{r}
+res_traf6dt_ctrl_df <- data.frame(gene = rownames(res_traf6dt_ctrl), res_traf6dt_ctrl,
+stringsAsFactors = F) %>% na.omit()
+res_traf6dt_ctrl_withgenes <- subset(res_traf6dt_ctrl_df, gene %in% genelist) %>% mutate(padj.new = p.adjust(pvalue, method = "BH"))
+
+res_tbmt_ctrl_df <- data.frame(gene = rownames(res_tbmt_ctrl), res_tbmt_ctrl,
+stringsAsFactors = F) %>% na.omit()
+res_tbmt_ctrl_withgenes <- subset(res_tbmt_ctrl_df, gene %in% genelist) %>% mutate(padj.new = p.adjust(pvalue, method = "BH"))
+
+res_tbmt_traf6dt_df <- data.frame(gene = rownames(res_traf6dt_ctrl), res_traf6dt_ctrl,
+stringsAsFactors = F) %>% na.omit()
+res_traf6dt_ctrl_withgenes <- subset(res_traf6dt_ctrl_df, gene %in% genelist) %>% mutate(padj.new = p.adjust(pvalue, method = "BH"))
+```
+
+```{r}
+k<-res_traf6dt_ctrl_withgenes %>% dplyr::select("log2FoldChange", "padj.new") %>% dplyr::mutate(minuslogp = -log10(padj.new), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+l<-res_tbmt_ctrl_withgenes %>% dplyr::select("log2FoldChange", "padj.new") %>% dplyr::mutate(minuslogp = -log10(padj.new), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+
+m <- merge(k,l,by=0) 
+
+png(file="signlog_genesselected.png", width=1980, height=1440)
+ggplot(m, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=10,color="grey", alpha=1)+
+  geom_point(data=subset(m, padj.new.x>0.1 & padj.new.y<0.1), size=10,color="red", alpha=1)+
+  geom_point(data=subset(m, padj.new.x<0.1 & padj.new.y>0.1), size=10,color="blue", alpha=1)+
+  geom_point(data=subset(m, padj.new.x<0.1 & padj.new.y<0.1), size=10,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_text_repel(data=m, aes(label=Row.names), size=10, color="black", nudge_y = 1, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  geom_point(aes(x=-0.5, y=18.75), color="purple", size=20)+
+  geom_point(aes(x=-0.5, y=17.5), color="red", size=20)+
+  geom_point(aes(x=-0.5, y=16.25), color="grey", size=20)+
+  annotate("text", x=-0.4, y=18.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=-0.4, y=17.5, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=-0.4, y=16.25, label="Neither", size=11, hjust=0)+
+  annotate("text", x=-0.6, y=20, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+```
+```{r}
+padj_with_genelist_excel <- m %>%
+  dplyr::select(Row.names, log2FoldChange.x, padj.new.x, signlogp.x,log2FoldChange.y, padj.new.y, signlogp.y) %>%
+  mutate(Significance = ifelse(m$padj.new.x<=0.1 & m$padj.new.y<=0.1, "Both", ifelse(m$padj.new.x<=0.1 & m$padj.new.y>0.1, "Only Traf6dT", ifelse(m$padj.new.x>0.1 & m$padj.new.y<=0.1, "Only TBMT", "Neither")))) %>%
+  dplyr::rename("Gene" = "Row.names", "LFC (Traf6dT vs Control)" = "log2FoldChange.x", "p-adj new (Traf6dT vs Control)" = "padj.new.x", "Sign of LFC x -log10p-adj (Traf6dT vs Control)" = "signlogp.x", "LFC (TBMT vs Control)" = "log2FoldChange.y", "p-adj new (TBMT vs Control)" = "padj.new.y", "Sign of LFC x -log10p-adj (TBMT vs Control)" = "signlogp.y")
+
+write.xlsx(padj_with_genelist_excel, "Cross Comparison Gene List with New p-adj.xlsx", overwrite = TRUE)
+```
+
+```{r}
+genelist_counts_tib <- subset(cnt.tib, GeneID %in% genelist)
+genelist_counts_mat<-as.matrix(genelist_counts_tib[,-1]) 
+rownames(genelist_counts_mat)<-genelist_counts_tib$GeneID
+
+genelist_counts_mat <- genelist_counts_mat[,order]
+coldata <- coldata[order,]
+all(rownames(coldata) == colnames(genelist_counts_mat))
+
+dds_withgenes <- DESeqDataSetFromMatrix(countData = genelist_counts_mat,
+                              colData = coldata,
+                              design = ~ Genotype)
+```
+
+```{r}
+dds_withgenes<- DESeq(dds_withgenes)
+
+res_tbmt_traf6dt_withgenes <- DESeq2::results(dds_withgenes, contrast=c("Genotype","TBMT","Traf6dT"), alpha = 0.1)
+res_tbmt_ctrl_withgenes <- DESeq2::results(dds_withgenes, contrast=c("Genotype","TBMT","Control"), alpha = 0.1)
+res_traf6dt_ctrl_withgenes <- DESeq2::results(dds_withgenes, contrast=c("Genotype","Traf6dT","Control"), alpha = 0.1)
+
+res_tbmt_ctrl_withgenes_df <-data.frame(gene = rownames(res_tbmt_ctrl_withgenes), res_tbmt_ctrl_withgenes,
+stringsAsFactors = F) 
+res_traf6dt_ctrl_withgenes_df <-data.frame(gene = rownames(res_traf6dt_ctrl_withgenes), res_traf6dt_ctrl_withgenes, stringsAsFactors = F) 
+res_tbmt_traf6dt_withgenes_df <-data.frame(gene = rownames(res_tbmt_traf6dt_withgenes), res_tbmt_traf6dt_withgenes, stringsAsFactors = F) 
+```
+```{r}
+k<-res_traf6dt_ctrl_withgenes_df %>% dplyr::select("log2FoldChange", "pvalue") %>% dplyr::mutate(minuslogp = -log10(pvalue), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+l<-res_tbmt_ctrl_withgenes_df %>% dplyr::select("log2FoldChange", "pvalue") %>% dplyr::mutate(minuslogp = -log10(pvalue), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+
+m <- merge(k,l,by=0) 
+
+png(file="signlog_genesselected.png", width=1980, height=1440)
+ggplot(m, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=10,color="grey", alpha=1)+
+  geom_point(data=subset(m, pvalue.x>0.1 & pvalue.y<0.1), size=10,color="red", alpha=1)+
+  geom_point(data=subset(m, pvalue.x<0.1 & pvalue.y>0.1), size=10,color="blue", alpha=1)+
+  geom_point(data=subset(m, pvalue.x<0.1 & pvalue.y<0.1), size=10,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-value))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-value))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_label_repel(data=m, aes(label=Row.names), size=10, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  geom_point(aes(x=6, y=-20), color="purple", size=20)+
+  geom_point(aes(x=6, y=-25), color="red", size=20)+
+  geom_point(aes(x=6, y=-30), color="blue", size=20)+
+  annotate("text", x=6.5, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=5.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+```
+```{r}
+E3Ligases <- read.xlsx("E3Ligases.xlsx")
+E3Ligases_list <- E3Ligases$Gene
+```
+
+```{r}
+a<-data.frame(gene = rownames(res_traf6dt_ctrl), res_traf6dt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+b<-data.frame(gene = rownames(res_tbmt_ctrl), res_tbmt_ctrl,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj")%>% dplyr::mutate(minuslogp = -log10(padj), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+
+c <- merge(a,b,by=0) 
+d <- c %>% 
+  dplyr::filter(padj.x<0.1, padj.y<0.1)
+e <- c %>%
+  dplyr::filter(padj.x < 0.1 | padj.y < 0.1)
+
+png(file="signlog_ligases.png", width=1980, height=1440)
+ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=1)+
+  geom_point(data=d, size=2.25,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 80, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_label_repel(data=subset(e, Row.names %in% E3Ligases_list), aes(label=Row.names), size=6, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  geom_point(aes(x=6, y=-20), color="purple", size=20)+
+  geom_point(aes(x=6, y=-25), color="red", size=20)+
+  geom_point(aes(x=6, y=-30), color="blue", size=20)+
+  annotate("text", x=6.5, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-24.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=6.5, y=-29.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=5.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+
+png(file="LFCcomparison_ligases.png", width=1980, height=1440)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=1)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=1)+
+  geom_point(data=d, size=2.5,color="purple", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.1 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=25, face = "bold"))+
+  ylab("TBMT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=25, face = "bold"))+
+  geom_label_repel(data=subset(e, Row.names %in% E3Ligases_list), aes(label=Row.names), size=7.5, color="black", nudge_y = 0.05, fontface = "bold", min.segment.length = unit(0.3, "lines"))+
+  annotate("text", x=6.2, y=-2.75, label="p-adj<0.1", size=10, fontface="bold.italic")+
+  geom_point(aes(x=5.5, y=-2.75), color="purple", size=25)+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")+
+  annotate("text", x=6, y=0.3, label="Both Upregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=6, y=-0.5, label="Traf6dT Upregulated\nTBMT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=0.5, label="TBMT Upregulated\nTraf6dT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=-0.3, label="Both Downregulated", size = 9, fontface="bold.italic", color="cyan4")
+dev.off()  
+```
+
+
+
