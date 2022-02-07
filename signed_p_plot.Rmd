@@ -1,0 +1,86 @@
+```{r}
+
+#Let's say we have two DESeq2 results that compare two different sample groups against the same sample group (i.e. Group2 vs Group1 and Group3 vs Group1). We want to visualize these together (kinda treating the Group 1 as a pivot).
+#Let's say that res_2vs1 and res_3vs1 are these DESeq2 results.
+
+
+a<-data.frame(gene = rownames(res_2vs1), res_2vs1 ,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+b<-data.frame(gene = rownames(res_3vs1), res_3vs1,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj")%>% dplyr::mutate(minuslogp = -log10(padj), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+c <- merge(a,b,by=0)
+
+#Choose the significant genes as a different data frame, adjust your own p thresholds.
+d <- c %>% 
+  dplyr::filter(padj.x<0.1, padj.y<0.1)
+ 
+  
+#Here we are saving as png but pdf also works well, but width and height need to be adjusted 
+png(file="signlog.png", width=1980, height=1440)
+ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=0.6)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=0.6)+
+  geom_point(data=d, size=2.25,color="purple", alpha=0.6)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TBMT vs Traf6dT (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  scale_x_continuous(breaks = seq(-20, 20, by = 5))+
+  scale_y_continuous(breaks = seq(-30, 140, by = 10))+
+  xlab("Traf6dT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TBMT vs Control (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.1), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = log10(0.1), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1), linetype="dashed")+
+  geom_label_repel(data=subset(c, signlogp.x>5 | signlogp.y>5), aes(label=Row.names), size=6, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)+
+  geom_label_repel(data=subset(c, signlogp.x<(-2) | signlogp.y<(-5)), aes(label=Row.names), size=6, color="black", nudge_y = 2, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)+
+  stat_cor(method = "spearman", size=12, label.y = 105, label.x = -16)+
+  annotate("text", x=-10, y=110, label="Spearman's Correlation of all genes:", size = 13)+
+  geom_point(aes(x=16, y=-20), color="purple", size=20)+
+  geom_point(aes(x=16, y=-28), color="red", size=20)+
+  geom_point(aes(x=16, y=-36), color="blue", size=20)+
+  annotate("text", x=16.75, y=-19.75, label="Both", size=11, hjust=0)+
+  annotate("text", x=16.75, y=-27.75, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=16.75, y=-35.75, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=15.5, y=-14, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()
+png(file="LFCcomparison.png", width=1980, height=1440)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=subset(c, padj.x>0.1 & padj.y<0.1), size=2.25,color="red", alpha=0.6)+
+  geom_point(data=subset(c, padj.x<0.1 & padj.y>0.1), size=2.25,color="blue", alpha=0.6)+
+  geom_point(data=d, size=2.5,color="purple", alpha=0.6)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.1 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Traf6dT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=25, face = "bold"))+
+  ylab("TBMT vs Control (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=25, face = "bold"))+
+  geom_label_repel(data=subset(d, log2FoldChange.x<(-1) & log2FoldChange.y<(-1)), aes(label=Row.names), size=7.5, color="black", nudge_y = 0.05, fontface = "bold", min.segment.length = unit(0.3, "lines"))+
+  geom_label_repel(data=subset(d, log2FoldChange.x>(0.5) & log2FoldChange.y<(0)), aes(label=Row.names), size=7.5, color="black", nudge_y = 0.05, fontface = "bold", min.segment.length = unit(0.3, "lines"))+
+  geom_label_repel(data=subset(e, log2FoldChange.x>2 | log2FoldChange.y<(-2.5)), aes(label=Row.names), size=7.5, color="black", nudge_y = 0.05, fontface = "bold", min.segment.length = unit(0.3, "lines"))+
+  stat_cor(data=d,method = "spearman", size=12, label.y = 5.5, label.x = -2.85, fontface="italic")+
+  annotate("text", x=-1.85, y=6.5, label="Spearman's Correlation of only\ncommonly significant genes", size = 13, fontface="italic")+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")+
+  annotate("text", x=6, y=0.3, label="Both Upregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=6, y=-0.5, label="Traf6dT Upregulated\nTBMT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=0.5, label="TBMT Upregulated\nTraf6dT Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  annotate("text", x=-3, y=-0.3, label="Both Downregulated", size = 9, fontface="bold.italic", color="cyan4")+
+  geom_point(aes(x=4.8, y=-2.6), color="purple", size=20)+
+  geom_point(aes(x=4.8, y=-3.1), color="red", size=20)+
+  geom_point(aes(x=4.8, y=-3.6), color="blue", size=20)+
+  annotate("text", x=5, y=-2.6, label="Both", size=11, hjust=0)+
+  annotate("text", x=5, y=-3.1, label="Only TBMT", size=11, hjust=0)+
+  annotate("text", x=5, y=-3.6, label="Only Traf6dT", size=11, hjust=0)+
+  annotate("text", x=4.5, y=-2.1, label="Significance (p-adj<0.1)", size=13, fontface="bold.italic", hjust=0)
+dev.off()  
+```
